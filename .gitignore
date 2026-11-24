@@ -1,0 +1,13 @@
+# Python / tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Generated Clash exports and interrupted atomic-write temporary files
+/clash-*个-????????-??????-??????.json
+/.clash-*.tmp

@@ -1,0 +1,486 @@
+"""Clash 导出契约测试；仅使用临时目录与模拟扫描，不连接外网。
+
+运行：python -B -m unittest discover -s tests -v
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import socket
+import sys
+import tempfile
+import unittest
+from contextlib import ExitStack, contextmanager, redirect_stderr
+from datetime import datetime
+from pathlib import Path
+from unittest import mock
+
+import proxy_probe as probe
+
+
+NOW = datetime(2026, 7, 4, 12, 34, 56, 123456)
+OLD_FILENAME = "clash-1个-20250101-010203-000001.json"
+CLASH_DOCUMENT = {"proxies": [], "proxy-groups": [], "rules": []}
+
+
+def proxy(ip="10.0.0.2", port=7890, location="新加坡"):
+    return probe.VerifiedProxy(
+        ip=ip,
+        port=port,
+        proxy_status="example.test HTTP 204",
+        public_ip="203.0.113.8",
+        location=location,
+    )
+
+
+@contextmanager
+def working_directory(path):
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def groups_by_name(document):
+    return {group["name"]: group for group in document["proxy-groups"]}
+
+
+class BuildClashConfigTests(unittest.TestCase):
+    def test_sorts_numerically_by_ipv4_then_port_without_mutating_input(self):
+        records = [
+            proxy("10.0.0.10", 7890, "美国"),
+            proxy("10.0.0.2", 7897, "日本"),
+            proxy("10.0.0.2", 7890, "新加坡"),
+            proxy("2.0.0.1", 8000, "德国"),
+        ]
+        original = list(records)
+        document = probe.build_clash_config(records)
+        self.assertEqual(records, original)
+        self.assertEqual(
+            [(node["server"], node["port"]) for node in document["proxies"]],
+            [("2.0.0.1", 8000), ("10.0.0.2", 7890),
+             ("10.0.0.2", 7897), ("10.0.0.10", 7890)],
+        )
+        self.assertEqual(
+            [node["name"] for node in document["proxies"]],
+            ["德国", "新加坡", "日本", "美国"],
+        )
+        for node in document["proxies"]:
+            self.assertEqual(node["type"], "http")
+            self.assertIsInstance(node["port"], int)
+        self.assertEqual(document, probe.build_clash_config(list(reversed(records))))
+
+    def test_duplicate_locations_are_numbered_in_sorted_order(self):
+        document = probe.build_clash_config([
+            proxy("10.0.0.10", location="新加坡"),
+            proxy("10.0.0.2", location="新加坡"),
+        ])
+        self.assertEqual(
+            [node["name"] for node in document["proxies"]],
+            ["新加坡 #1", "新加坡 #2"],
+        )
+
+    def test_empty_and_whitespace_locations_use_unknown_location(self):
+        for location in ("", " \t "):
+            with self.subTest(location=location):
+                document = probe.build_clash_config([proxy(location=location)])
+                self.assertEqual(document["proxies"][0]["name"], "未知属地")
+        document = probe.build_clash_config([
+            proxy("10.0.0.1", location=""),
+            proxy("10.0.0.2", location="未知属地"),
+        ])
+        self.assertEqual(
+            [node["name"] for node in document["proxies"]],
+            ["未知属地 #1", "未知属地 #2"],
+        )
+
+    def test_names_are_globally_unique_despite_reserved_and_suffix_collisions(self):
+        locations = [
+            "自动选择", "节点选择", "自动选择 #2", "节点选择 #2",
+            "新加坡", "新加坡", "新加坡 #1", "新加坡 #2",
+            "新加坡 #1 #2", "", "未知属地", "未知属地 #1",
+        ]
+        # 自然后缀属地在重复属地前后出现，两种分配顺序都不能重名。
+        for ordered_locations in (locations, list(reversed(locations))):
+            with self.subTest(locations=ordered_locations):
+                records = [
+                    proxy(f"10.0.0.{index}", location=location)
+                    for index, location in enumerate(ordered_locations, 1)
+                ]
+                document = probe.build_clash_config(records)
+                names = [node["name"] for node in document["proxies"]]
+                self.assertEqual(len(names), len(records))
+                self.assertEqual(len(set(names)), len(names))
+                self.assertTrue(set(names).isdisjoint({"自动选择", "节点选择"}))
+                groups = groups_by_name(document)
+                self.assertEqual(groups["节点选择"]["proxies"], ["自动选择", *names])
+                expected_singapore = [
+                    name for name, record in zip(names, records)
+                    if "新加坡" in record.location
+                ]
+                self.assertEqual(groups["自动选择"]["proxies"], expected_singapore)
+
+    def test_automatic_group_prefers_chinese_and_case_insensitive_singapore(self):
+        records = [
+            proxy("10.0.0.1", location="日本"),
+            proxy("10.0.0.2", location="亚洲 / 新加坡"),
+            proxy("10.0.0.3", location="  SINGAPORE / Central  "),
+            proxy("10.0.0.4", location="sInGaPoRe"),
+            proxy("10.0.0.5", location="美国"),
+        ]
+        document = probe.build_clash_config(records)
+        names = [node["name"] for node in document["proxies"]]
+        groups = groups_by_name(document)
+        self.assertEqual(set(groups), {"自动选择", "节点选择"})
+        self.assertEqual(groups["自动选择"]["type"], "url-test")
+        self.assertEqual(groups["自动选择"]["proxies"], names[1:4])
+        self.assertEqual(groups["节点选择"]["type"], "select")
+        self.assertEqual(groups["节点选择"]["proxies"], ["自动选择", *names])
+        self.assertEqual(document["rules"], ["MATCH,节点选择"])
+
+    def test_automatic_group_falls_back_to_every_node(self):
+        document = probe.build_clash_config([
+            proxy("10.0.0.2", location="日本"),
+            proxy("10.0.0.1", location="美国"),
+        ])
+        names = [node["name"] for node in document["proxies"]]
+        groups = groups_by_name(document)
+        self.assertEqual(groups["自动选择"]["proxies"], names)
+        self.assertEqual(groups["节点选择"]["proxies"], ["自动选择", *names])
+        self.assertEqual(document["rules"], ["MATCH,节点选择"])
+
+    def test_empty_results_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            probe.build_clash_config([])
+
+
+class ExportClashJsonTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.records = [proxy(), proxy("10.0.0.3", location="日本")]
+
+    def write_json(self, name, document=CLASH_DOCUMENT):
+        path = self.directory / name
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def snapshot(self):
+        return {
+            path.name: path.read_bytes()
+            for path in self.directory.iterdir() if path.is_file()
+        }
+
+    def test_filename_count_microseconds_and_readable_utf8_json(self):
+        path = probe.export_clash_json(self.records, self.directory, NOW)
+        self.assertIsInstance(path, Path)
+        self.assertEqual(path, self.directory / "clash-2个-20260704-123456-123456.json")
+        text = path.read_bytes().decode("utf-8")
+        self.assertIn("新加坡", text)
+        self.assertIn("节点选择", text)
+        self.assertNotIn("\\u65b0", text)
+        self.assertEqual(json.loads(text), probe.build_clash_config(self.records))
+        self.assertEqual(list(self.directory.iterdir()), [path])
+
+    def test_second_real_export_replaces_previous_generated_config(self):
+        first = probe.export_clash_json(self.records, self.directory, NOW)
+        new_records = [proxy("10.0.0.5", location="日本")]
+        second = probe.export_clash_json(
+            new_records, self.directory, NOW.replace(microsecond=123457)
+        )
+        self.assertFalse(first.exists())
+        self.assertEqual(list(self.directory.iterdir()), [second])
+        self.assertEqual(
+            json.loads(second.read_text(encoding="utf-8")),
+            probe.build_clash_config(new_records),
+        )
+
+    def test_same_timestamp_success_replaces_atomically_and_failure_keeps_original(self):
+        first = probe.export_clash_json(self.records, self.directory, NOW)
+        original = first.read_bytes()
+        changed = [proxy("10.0.0.8"), proxy("10.0.0.9", location="日本")]
+        with mock.patch.object(probe.os, "replace", side_effect=OSError("locked")):
+            with self.assertRaises(OSError):
+                probe.export_clash_json(changed, self.directory, NOW)
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(list(self.directory.iterdir()), [first])
+        second = probe.export_clash_json(changed, self.directory, NOW)
+        self.assertEqual(first, second)
+        self.assertEqual(list(self.directory.iterdir()), [second])
+        self.assertEqual(
+            json.loads(second.read_text(encoding="utf-8")),
+            probe.build_clash_config(changed),
+        )
+
+    def test_explicit_new_output_directory_is_created(self):
+        directory = self.directory / "nested" / "output"
+        path = probe.export_clash_json(self.records, directory, NOW)
+        self.assertEqual(path.parent, directory)
+        self.assertTrue(path.is_file())
+
+    def test_default_output_is_not_current_working_directory(self):
+        output = self.directory / "script-directory"
+        elsewhere = self.directory / "unrelated-cwd"
+        elsewhere.mkdir()
+        with mock.patch.object(probe, "DEFAULT_OUTPUT_DIR", output):
+            with working_directory(elsewhere):
+                path = probe.export_clash_json(self.records, now=NOW)
+        self.assertEqual(path.parent, output)
+        self.assertTrue(path.is_file())
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_cleanup_requires_strict_filename_and_safe_clash_json_object(self):
+        old_paths = [
+            self.write_json(OLD_FILENAME),
+            self.write_json("clash-12个-20250102-010203-000002.json"),
+        ]
+        preserve = {
+            "proxy_probe.json": {"local_ip": "127.0.0.1", "target_ip": "10.0.0.1"},
+            "unrelated.json": CLASH_DOCUMENT,
+            "backup-clash-1个-20250101-010203-000001.json": CLASH_DOCUMENT,
+            "clash-1个-20250101-010203-000001.json.backup": CLASH_DOCUMENT,
+            "clash-1个-20250101-010203.json": CLASH_DOCUMENT,
+            "clash-1个-20250101-010203-00001.json": CLASH_DOCUMENT,
+            "clash-1个-20250101-010203-0000001.json": CLASH_DOCUMENT,
+            "clash-0个-20250101-010203-000001.json": CLASH_DOCUMENT,
+            "clash-01个-20250101-010203-000001.json": CLASH_DOCUMENT,
+            "clash-1个-20250101-010203-000003.json": [],
+            "clash-1个-20250101-010203-000004.json": {"proxies": [], "rules": []},
+            "clash-1个-20250101-010203-000005.json": {"proxy-groups": [], "rules": []},
+            "clash-1个-20250101-010203-000006.json": {"proxies": [], "proxy-groups": []},
+            "clash-1个-20250101-010203-000007.json": {**CLASH_DOCUMENT, "local_ip": "127.0.0.1"},
+            "clash-1个-20250101-010203-000008.json": {**CLASH_DOCUMENT, "target_ip": "10.0.0.1"},
+            "clash-1个-20250101-010203-000009.json": "not an object",
+        }
+        for name, document in preserve.items():
+            self.write_json(name, document)
+        (self.directory / "clash-1个-20250101-010203-000010.json").write_text(
+            "{invalid JSON", encoding="utf-8"
+        )
+        (self.directory / "proxy.yaml").write_text("proxies: []\n", encoding="utf-8")
+        named_directory = self.directory / "clash-1个-20250101-010203-000011.json"
+        named_directory.mkdir()
+        before = self.snapshot()
+        for old_path in old_paths:
+            before.pop(old_path.name)
+        path = probe.export_clash_json(self.records, self.directory, NOW)
+        after = self.snapshot()
+        after.pop(path.name)
+        self.assertEqual(after, before)
+        self.assertTrue(named_directory.is_dir())
+        for old_path in old_paths:
+            self.assertFalse(old_path.exists())
+
+    def test_atomic_replace_receives_complete_same_directory_temporary_file(self):
+        old = self.write_json(OLD_FILENAME)
+        original_replace = os.replace
+        committed = []
+
+        def check_replace(source, destination):
+            source, destination = Path(source), Path(destination)
+            self.assertEqual(source.parent, destination.parent)
+            self.assertEqual(source.parent, self.directory)
+            self.assertNotEqual(source, destination)
+            self.assertTrue(old.exists(), "提交成功前不得删除旧文件")
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                json.loads(source.read_text(encoding="utf-8")),
+                probe.build_clash_config(self.records),
+            )
+            original_replace(source, destination)
+            committed.append(destination)
+
+        with mock.patch.object(probe.os, "replace", side_effect=check_replace) as replace:
+            path = probe.export_clash_json(self.records, self.directory, NOW)
+        replace.assert_called_once()
+        self.assertEqual(committed, [path])
+        self.assertFalse(old.exists())
+        self.assertEqual(list(self.directory.iterdir()), [path])
+
+    def test_empty_results_preserve_old_files(self):
+        self.write_json(OLD_FILENAME)
+        before = self.snapshot()
+        with mock.patch.object(probe.os, "replace") as replace:
+            with self.assertRaises(ValueError):
+                probe.export_clash_json([], self.directory, NOW)
+        replace.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_serialization_failure_preserves_old_files_and_leaves_no_temporary(self):
+        self.write_json(OLD_FILENAME)
+        before = self.snapshot()
+        invalid_document = {**CLASH_DOCUMENT, "unserializable": object()}
+        with mock.patch.object(probe, "build_clash_config", return_value=invalid_document):
+            with mock.patch.object(probe.os, "replace") as replace:
+                with self.assertRaises((TypeError, ValueError)):
+                    probe.export_clash_json(self.records, self.directory, NOW)
+        replace.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_atomic_commit_failure_preserves_old_files_and_removes_temporary(self):
+        self.write_json(OLD_FILENAME)
+        before = self.snapshot()
+        with mock.patch.object(probe.os, "replace", side_effect=OSError("commit failed")) as replace:
+            with self.assertRaises(OSError):
+                probe.export_clash_json(self.records, self.directory, NOW)
+        replace.assert_called_once()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fsync_failure_preserves_old_files_and_removes_temporary(self):
+        self.write_json(OLD_FILENAME)
+        before = self.snapshot()
+        with mock.patch.object(probe.os, "fsync", side_effect=OSError("disk full")):
+            with mock.patch.object(probe.os, "replace") as replace:
+                with self.assertRaises(OSError):
+                    probe.export_clash_json(self.records, self.directory, NOW)
+        replace.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_old_file_delete_failure_warns_but_returns_new_config(self):
+        old = self.write_json(OLD_FILENAME)
+        old_bytes = old.read_bytes()
+        original_unlink = Path.unlink
+
+        def unlink(path, *args, **kwargs):
+            if path == old:
+                raise PermissionError("old file is locked")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=unlink):
+            with mock.patch.object(probe, "log") as log:
+                path = probe.export_clash_json(self.records, self.directory, NOW)
+        self.assertTrue(path.is_file())
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                         probe.build_clash_config(self.records))
+        self.assertEqual(old.read_bytes(), old_bytes)
+        warnings = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("警告", warnings)
+        self.assertIn(old.name, warnings)
+        self.assertEqual(set(self.directory.iterdir()), {old, path})
+
+    def test_same_name_unrelated_json_is_not_overwritten(self):
+        occupied = self.write_json(
+            "clash-2个-20260704-123456-123456.json",
+            {**CLASH_DOCUMENT, "local_ip": "127.0.0.1"},
+        )
+        self.write_json(OLD_FILENAME)
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            probe.export_clash_json(self.records, self.directory, NOW)
+        self.assertTrue(occupied.exists())
+        self.assertEqual(self.snapshot(), before)
+
+
+class MainTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.config_path = self.directory / "proxy_probe.json"
+        self.config_bytes = json.dumps({
+            "local_ip": "127.0.0.1",
+            "target_ip": "10.0.0.2",
+            "prefix_length": 32,
+            "bind_source_ip": False,
+        }).encode("utf-8")
+        self.config_path.write_bytes(self.config_bytes)
+        self.output = self.directory / "script-output"
+        self.output.mkdir()
+        self.elsewhere = self.directory / "other-cwd"
+        self.elsewhere.mkdir()
+        self.records = [proxy()]
+        self.endpoints = [("10.0.0.2", 7890)]
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(probe, "DEFAULT_CONFIG", self.config_path))
+        self.stack.enter_context(mock.patch.object(probe, "DEFAULT_OUTPUT_DIR", self.output))
+        self.stack.enter_context(mock.patch.object(sys, "argv", ["proxy_probe.py"]))
+        self.load = self.stack.enter_context(mock.patch.object(probe, "load_config", wraps=probe.load_config))
+        self.binding = self.stack.enter_context(mock.patch.object(probe, "check_source_binding"))
+        self.scan = self.stack.enter_context(mock.patch.object(
+            probe, "pipeline_scan", return_value=(self.endpoints, self.records, False)
+        ))
+        self.stack.enter_context(mock.patch.object(probe, "print_result"))
+        self.stack.enter_context(mock.patch.object(probe, "log"))
+        self.stack.enter_context(redirect_stderr(io.StringIO()))
+        self.stack.enter_context(mock.patch.object(
+            socket, "create_connection", side_effect=AssertionError("测试禁止真实网络连接")
+        ))
+        self.stack.enter_context(mock.patch.object(
+            probe.requests.Session, "request", side_effect=AssertionError("测试禁止真实 HTTP 请求")
+        ))
+
+    def old_file(self):
+        path = self.output / OLD_FILENAME
+        path.write_text(json.dumps(CLASH_DOCUMENT), encoding="utf-8")
+        return path
+
+    def test_default_arguments_really_load_default_config_and_auto_export_from_other_cwd(self):
+        with mock.patch.object(probe, "export_clash_json", wraps=probe.export_clash_json) as export:
+            with working_directory(self.elsewhere):
+                status = probe.main()
+        self.assertEqual(status, 0)
+        self.load.assert_called_once_with(self.config_path)
+        self.scan.assert_called_once()
+        config = self.scan.call_args.args[0]
+        self.assertIsInstance(config, probe.Config)
+        self.assertEqual(config.local_ip, "127.0.0.1")
+        self.assertEqual(config.target_ip, "10.0.0.2")
+        self.binding.assert_called_once_with(config)
+        export.assert_called_once_with(self.records)
+        exported = list(self.output.iterdir())
+        self.assertEqual(len(exported), 1)
+        self.assertRegex(exported[0].name, r"^clash-1个-[0-9]{8}-[0-9]{6}-[0-9]{6}\.json$")
+        self.assertEqual(json.loads(exported[0].read_text(encoding="utf-8")),
+                         probe.build_clash_config(self.records))
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+        self.assertEqual(self.config_path.read_bytes(), self.config_bytes)
+
+    def test_no_results_returns_one_and_never_exports_or_deletes_old_file(self):
+        old = self.old_file()
+        before = old.read_bytes()
+        self.scan.return_value = (self.endpoints, [], False)
+        with mock.patch.object(probe, "export_clash_json") as export:
+            self.assertEqual(probe.main(), 1)
+        export.assert_not_called()
+        self.assertEqual(old.read_bytes(), before)
+        self.assertEqual(list(self.output.iterdir()), [old])
+
+    def test_interrupted_scan_returns_130_even_with_partial_results_and_never_exports(self):
+        old = self.old_file()
+        before = old.read_bytes()
+        for records in ([], self.records):
+            with self.subTest(has_results=bool(records)):
+                self.scan.return_value = (self.endpoints, records, True)
+                with mock.patch.object(probe, "export_clash_json") as export:
+                    self.assertEqual(probe.main(), 130)
+                export.assert_not_called()
+                self.assertEqual(old.read_bytes(), before)
+                self.assertEqual(list(self.output.iterdir()), [old])
+
+    def test_keyboard_interrupt_returns_130_without_exporting(self):
+        old = self.old_file()
+        self.scan.side_effect = KeyboardInterrupt
+        with mock.patch.object(probe, "export_clash_json") as export:
+            self.assertEqual(probe.main(), 130)
+        export.assert_not_called()
+        self.assertTrue(old.exists())
+
+    def test_export_oserror_returns_two_and_preserves_old_file(self):
+        old = self.old_file()
+        before = old.read_bytes()
+        with mock.patch.object(probe.os, "replace", side_effect=OSError("cannot commit")):
+            with mock.patch.object(probe, "export_clash_json", wraps=probe.export_clash_json) as export:
+                self.assertEqual(probe.main(), 2)
+        export.assert_called_once_with(self.records)
+        self.assertEqual(old.read_bytes(), before)
+        self.assertEqual(list(self.output.iterdir()), [old])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,49 @@
+mixed-port: 7890
+mode: rule
+log-level: info
+ipv6: false
+allow-lan: false
+
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+  route-exclude-address:
+    - 218.194.49.124/32
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 1.1.1.1
+
+proxies:
+  - name: "218局域网代理"
+    type: socks5
+    server: 218.194.49.124
+    port: 7897
+    udp: true
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - "218局域网代理"
+      - DIRECT
+
+rules:
+  # 防止连接代理服务器自身时再次进入代理
+  - IP-CIDR,218.194.49.124/32,DIRECT,no-resolve
+
+  # 局域网地址直连
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+
+  # 其余流量全部发送给另一台机器
+  - MATCH,PROXY

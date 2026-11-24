@@ -1,0 +1,19 @@
+{
+  "local_ip": "192.168.8.101",
+  "target_ip": "218.194.50.3",
+  "prefix_length": 20,
+  "proxy_port": 7897,
+  "connect_timeout": 0.35,
+  "proxy_timeout": 5.0,
+  "geo_timeout": 5.0,
+  "workers": 256,
+  "proxy_workers": 256,
+  "geo_workers": 256,
+  "bind_source_ip": true,
+  "proxy_test_urls": [
+    "https://api.ip.sb/ip",
+    "https://cp.cloudflare.com/generate_204",
+    "https://www.gstatic.com/generate_204"
+  ],
+  "exclude_ips": []
+}
